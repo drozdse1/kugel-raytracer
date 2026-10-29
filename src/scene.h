@@ -29,8 +29,10 @@ struct Params {
     uint32_t width;
     uint32_t height;
     uint32_t sphere_count;
-    uint32_t pad;
+    uint32_t bounces;  // Sprünge pro Pixel, 1..8. Im Shader image.w.
 };
+
+constexpr uint32_t kDefaultBounces = 4;
 
 // std430-Struct im Shader. material.x ist Metall, material.y ist Rauheit.
 struct GpuSphere {

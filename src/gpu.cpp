@@ -1,12 +1,12 @@
-#include "gpu.h"
+#include "log.h"
 
 #include "error.h"
+#include "gpu.h"
 #include "mandelbrot_spv.h"
 #include "trace_spv.h"
 
 #include <cmath>
 #include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -171,15 +171,15 @@ void Gpu::create_device() {
         VkDeviceSize local;
     };
     std::vector<Choice> choices;
-    std::cout << "Vulkan-Geräte:\n";
+    spdlog::info("Vulkan-Geräte:");
     for (VkPhysicalDevice found : devices) {
         Choice choice;
         choice.device = found;
         vkGetPhysicalDeviceProperties(found, &choice.props);
         choice.local = local_memory(found);
         choices.push_back(choice);
-        std::cout << "  " << choice.props.deviceName << " (" << device_type_name(choice.props.deviceType)
-                  << ", " << (choice.local / (1024 * 1024)) << " MiB)\n";
+        spdlog::info("  {} ({}, {} MiB)", choice.props.deviceName, device_type_name(choice.props.deviceType),
+                     choice.local / (1024 * 1024));
     }
 
     auto better = [](const Choice& candidate, const Choice& current) {
@@ -205,7 +205,7 @@ void Gpu::create_device() {
         }
     }
     physical = selected.device;
-    std::cout << "Gewählt: " << selected.props.deviceName << "\n";
+    spdlog::info("Gewählt: {}", selected.props.deviceName);
 
     uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
@@ -331,7 +331,7 @@ void Gpu::create_mandel() {
     pipeline_info.layout = mandel_pipeline_layout;
     vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &mandel_pipeline),
              "vkCreateComputePipelines");
-    std::cout << "Mandelbrot-Pipeline: " << kMandelSize << "x" << kMandelSize << ", jede Frame.\n";
+    spdlog::info("Mandelbrot-Pipeline: {}x{}, jede Frame.", kMandelSize, kMandelSize);
 }
 
 void Gpu::create_pipeline(const std::vector<GpuSphere>& sphere_data, const Params& params_data) {

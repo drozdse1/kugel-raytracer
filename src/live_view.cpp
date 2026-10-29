@@ -1,6 +1,8 @@
-#include "live_view.h"
+#include "log.h"
 
 #include "error.h"
+#include "live_view.h"
+#include "scene.h"
 
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -8,14 +10,18 @@
 #include <sys/shm.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <string>
 
 namespace {
 
 constexpr uint32_t kRayBlocks[] = {1, 2, 3, 4, 6, 8};
 constexpr int kRayBlockCount = static_cast<int>(sizeof(kRayBlocks) / sizeof(kRayBlocks[0]));
+constexpr uint32_t kBounceCounts[] = {1, 2, 3, 4, 5, 6, 7, 8};
+constexpr int kBounceCountCount = static_cast<int>(sizeof(kBounceCounts) / sizeof(kBounceCounts[0]));
+static_assert(kBounceCounts[3] == kDefaultBounces, "Startindex 3 muss die voreingestellte Sprungtiefe sein");
 
 int mask_shift(unsigned long mask) {
     int shift = 0;
@@ -64,9 +70,20 @@ LiveView::LiveView(uint32_t view_width, uint32_t view_height) : width(view_width
     }
     XMapWindow(display, window);
     gc = XCreateGC(display, window, 0, nullptr);
+    font = XLoadQueryFont(display, "9x15");
+    if (font == nullptr) {
+        font = XLoadQueryFont(display, "fixed");
+    }
+    if (font == nullptr) {
+        spdlog::warn("Keine X11-Schrift für das Debug-Overlay.");
+    }
     XSync(display, False);
     create_image();
-    std::cout << (use_shm ? "Ausgabe über Shared Memory." : "Ausgabe über XPutImage.") << std::endl;
+    if (use_shm) {
+        spdlog::info("Ausgabe über Shared Memory.");
+    } else {
+        spdlog::warn("Ausgabe über XPutImage.");
+    }
 }
 
 LiveView::~LiveView() {
@@ -74,6 +91,9 @@ LiveView::~LiveView() {
         return;
     }
     destroy_image();
+    if (font != nullptr) {
+        XFreeFont(display, font);
+    }
     if (gc != nullptr) {
         XFreeGC(display, gc);
     }
@@ -121,6 +141,24 @@ bool LiveView::pump() {
                     quality_dirty = true;
                 }
             }
+            KeySym shifted = XLookupKeysym(&event.xkey, 1);
+            if ((key == XK_question || shifted == XK_question) && event.xkey.time - last_overlay_ms >= 160) {
+                last_overlay_ms = event.xkey.time;
+                overlay = !overlay;
+                spdlog::info(overlay ? "Debug-Overlay an." : "Debug-Overlay aus.");
+            }
+            bool left = key == XK_Left || key == XK_KP_Left;
+            bool right = key == XK_Right || key == XK_KP_Right;
+            if ((left || right) && event.xkey.time - last_depth_ms >= 160) {
+                last_depth_ms = event.xkey.time;
+                if (left && bounce_index > 0) {
+                    --bounce_index;
+                    depth_dirty = true;
+                } else if (right && bounce_index + 1 < kBounceCountCount) {
+                    ++bounce_index;
+                    depth_dirty = true;
+                }
+            }
         }
     }
     return true;
@@ -151,11 +189,23 @@ bool LiveView::take_quality() {
     return true;
 }
 
+uint32_t LiveView::bounce_count() const {
+    return kBounceCounts[bounce_index];
+}
+
+bool LiveView::take_depth() {
+    if (!depth_dirty) {
+        return false;
+    }
+    depth_dirty = false;
+    return true;
+}
+
 void LiveView::show_rays(uint32_t render_width, uint32_t render_height) {
     uint32_t block = ray_block();
     std::string title = "Kugel-Raytracer — " + std::to_string(render_width) + "x" +
                         std::to_string(render_height) + " Strahlen, 1 pro " + std::to_string(block) + "x" +
-                        std::to_string(block) + " Pixel";
+                        std::to_string(block) + " Pixel, " + std::to_string(bounce_count()) + " Sprünge";
     XStoreName(display, window, title.c_str());
 }
 
@@ -277,6 +327,63 @@ void LiveView::present(const float* pixels, uint32_t source_width, uint32_t sour
         XSync(display, False);
     } else {
         XPutImage(display, window, gc, image, 0, 0, 0, 0, width, height);
-        XFlush(display);
+    }
+    note_frame();
+    if (overlay) {
+        draw_overlay();
+    }
+    XFlush(display);
+}
+
+void LiveView::note_frame() {
+    using clock = std::chrono::steady_clock;
+    auto now = clock::now();
+    if (overlay_frames == 0 && overlay_fps == 0.0f) {
+        overlay_mark = now;
+    }
+    ++overlay_frames;
+    float elapsed = std::chrono::duration<float>(now - overlay_mark).count();
+    if (elapsed >= 0.5f) {
+        overlay_fps = static_cast<float>(overlay_frames) / elapsed;
+        overlay_frames = 0;
+        overlay_mark = now;
+    }
+}
+
+void LiveView::draw_overlay() {
+    if (font == nullptr || gc == nullptr) {
+        return;
+    }
+    char lines[3][64];
+    if (overlay_fps <= 0.0f) {
+        std::snprintf(lines[0], sizeof(lines[0]), "fps ...");
+    } else {
+        std::snprintf(lines[0], sizeof(lines[0]), "%.1f fps", static_cast<double>(overlay_fps));
+    }
+    std::snprintf(lines[1], sizeof(lines[1]), "Tiefe %u", bounce_count());
+    std::snprintf(lines[2], sizeof(lines[2]), "%ux%u Pixel pro Strahl", ray_block(), ray_block());
+
+    int line_height = font->ascent + font->descent + 4;
+    int widest = 0;
+    for (const char* line : lines) {
+        int text_width = XTextWidth(font, line, static_cast<int>(std::strlen(line)));
+        if (text_width > widest) {
+            widest = text_width;
+        }
+    }
+    int pad = 10;
+    int origin_x = 16;
+    int origin_y = 16;
+    unsigned int box_width = static_cast<unsigned int>(widest + pad * 2);
+    unsigned int box_height = static_cast<unsigned int>(line_height * 3 + pad * 2);
+    int screen = DefaultScreen(display);
+    XSetFont(display, gc, font->fid);
+    XSetForeground(display, gc, BlackPixel(display, screen));
+    XFillRectangle(display, window, gc, origin_x, origin_y, box_width, box_height);
+    XSetForeground(display, gc, WhitePixel(display, screen));
+    int baseline = origin_y + pad + font->ascent;
+    for (const char* line : lines) {
+        XDrawString(display, window, gc, origin_x + pad, baseline, line, static_cast<int>(std::strlen(line)));
+        baseline += line_height;
     }
 }

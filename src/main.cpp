@@ -2,6 +2,8 @@
 // Scene hält Kugeln, Kamera und Licht. Gpu rechnet Mandelbrot und Strahlen.
 // LiveView zeigt das Bild, RgbImage schreibt ein Standbild.
 
+#include "log.h"
+
 #include "error.h"
 #include "gpu.h"
 #include "image.h"
@@ -9,22 +11,24 @@
 #include "scene.h"
 
 #include <chrono>
-#include <iostream>
 #include <string>
 #include <thread>
 
 namespace {
 
 void usage() {
-    std::cout << "Verwendung: kugel-raytracer [breite] [hoehe]\n"
-              << "           kugel-raytracer --bild ausgabe.ppm [breite] [hoehe]\n"
-              << "Ohne --bild öffnet sich ein Fenster. Die Größe lässt sich ändern. "
-                 "Pfeil hoch und runter ändert die Strahlzahl. Escape oder Q beendet es.\n";
+    spdlog::info(
+        "Verwendung: kugel-raytracer [breite] [hoehe]\n"
+        "            kugel-raytracer --bild ausgabe.ppm [breite] [hoehe]\n"
+        "Ohne --bild öffnet sich ein Fenster. Die Größe lässt sich ändern. "
+        "Pfeil hoch und runter ändert die Strahlzahl. Pfeil links und rechts ändert die Sprungtiefe. "
+        "Fragezeichen schaltet das Debug-Overlay ein. Escape oder Q beendet es.");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    setup_log();
     try {
         uint32_t width = 1280;
         uint32_t height = 720;
@@ -38,6 +42,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string(argv[1]) == "--bild") {
             still = true;
             if (argc < 3) {
+                spdlog::error("Bei --bild fehlt der Dateiname");
                 usage();
                 return 1;
             }
@@ -73,7 +78,7 @@ int main(int argc, char** argv) {
             RgbImage image = RgbImage::read(gpu, width, height);
             image.write_ppm(still_path);
             image.report();
-            std::cout << "Geschrieben: " << still_path << "\n";
+            spdlog::info("Geschrieben: {}", still_path);
             return 0;
         }
 
@@ -97,13 +102,15 @@ int main(int argc, char** argv) {
             view.show_rays(render_width, render_height);
         };
 
-        std::cout << "Fenster offen, " << width << "x" << height
-                  << ". Die Größe lässt sich ändern. Pfeil runter rechnet weniger Strahlen, "
-                     "das Bild wird gröber und schneller, Pfeil hoch macht es wieder feiner. "
-                     "Die Kamera kreist auf einer Krone, die Kugeln drehen und "
-                     "spiegeln, das Mandelbrot wandert, das Licht wandert auf Ellipsen. "
-                     "Beenden mit Escape oder Q."
-                  << std::endl;
+        spdlog::info(
+            "Fenster offen, {}x{}. Die Größe lässt sich ändern. Pfeil runter rechnet weniger Strahlen, "
+            "das Bild wird gröber und schneller, Pfeil hoch macht es wieder feiner. "
+            "Pfeil links verringert die Sprünge, Pfeil rechts erhöht sie: 1 bis 8. "
+            "Fragezeichen schaltet ein Debug-Overlay mit Bildrate, Tiefe und Pixel pro Strahl ein. "
+            "Die Kamera kreist auf einer Krone, die Kugeln drehen und "
+            "spiegeln, das Mandelbrot wandert, das Licht wandert auf Ellipsen. "
+            "Beenden mit Escape oder Q.",
+            width, height);
         using clock = std::chrono::steady_clock;
         auto previous = clock::now();
         auto fps_mark = previous;
@@ -126,10 +133,15 @@ int main(int argc, char** argv) {
             if (resized || quality) {
                 retarget();
                 if (quality) {
-                    std::cout << "Strahlen: 1 pro " << view.ray_block() << "x" << view.ray_block()
-                              << " Pixel, gerechnet " << render_width << "x" << render_height << std::endl;
+                    spdlog::info("Strahlen: 1 pro {}x{} Pixel, gerechnet {}x{}", view.ray_block(),
+                                 view.ray_block(), render_width, render_height);
                 }
             }
+            if (view.take_depth()) {
+                spdlog::info("Sprünge: {}", view.bounce_count());
+                view.show_rays(render_width, render_height);
+            }
+            params.bounces = view.bounce_count();
             auto now = clock::now();
             float dt = std::chrono::duration<float>(now - previous).count();
             previous = now;
@@ -150,8 +162,9 @@ int main(int argc, char** argv) {
             ++frames;
             float elapsed = std::chrono::duration<float>(now - fps_mark).count();
             if (elapsed >= 1.0f) {
-                std::cout << "Bildrate: " << (static_cast<float>(frames) / elapsed) << " fps, " << render_width
-                          << "x" << render_height << " Strahlen" << std::endl;
+                spdlog::info("Bildrate: {:.1f} fps, {}x{} Strahlen, {} Sprünge",
+                             static_cast<float>(frames) / elapsed, render_width, render_height,
+                             view.bounce_count());
                 frames = 0;
                 fps_mark = now;
             }
@@ -161,10 +174,10 @@ int main(int argc, char** argv) {
             }
         }
         gpu.unmap_staging();
-        std::cout << "Fenster geschlossen.\n";
+        spdlog::info("Fenster geschlossen.");
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << "\n";
+        spdlog::error("{}", error.what());
         return 1;
     }
 }

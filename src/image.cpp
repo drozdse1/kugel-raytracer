@@ -1,12 +1,12 @@
-#include "image.h"
+#include "log.h"
 
 #include "error.h"
 #include "gpu.h"
+#include "image.h"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <iostream>
 
 RgbImage RgbImage::read(Gpu& gpu, uint32_t width, uint32_t height) {
     const float* pixels = gpu.map_staging();
@@ -76,6 +76,6 @@ void RgbImage::report() const {
             }
         }
     }
-    std::cout << "Kontrolle: Himmel " << sky << ", Boden hell " << floor_lit << ", Schatten " << shadow
-              << ", rot " << red << ", blau " << blue << ", gold " << gold << "\n";
+    spdlog::info("Kontrolle: Himmel {}, Boden hell {}, Schatten {}, rot {}, blau {}, gold {}", sky, floor_lit,
+                 shadow, red, blue, gold);
 }

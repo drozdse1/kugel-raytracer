@@ -3,6 +3,7 @@
 #include <X11/Xlib.h>
 #include <X11/extensions/XShm.h>
 
+#include <chrono>
 #include <cstdint>
 
 // Ein Strahl deckt block×block Fensterpixel. Pfeil runter macht die Blöcke größer.
@@ -21,12 +22,16 @@ public:
     bool take_resize(uint32_t& out_width, uint32_t& out_height);
     uint32_t ray_block() const;
     bool take_quality();
+    uint32_t bounce_count() const;
+    bool take_depth();
     void show_rays(uint32_t render_width, uint32_t render_height);
     void present(const float* pixels, uint32_t source_width, uint32_t source_height);
 
 private:
     void destroy_image();
     void create_image();
+    void note_frame();
+    void draw_overlay();
 
     Display* display = nullptr;
     Window window = 0;
@@ -43,7 +48,16 @@ private:
     int ray_block_index = 0;
     bool quality_dirty = false;
     unsigned long last_quality_ms = 0;
+    int bounce_index = 3;
+    bool depth_dirty = false;
+    unsigned long last_depth_ms = 0;
     int red_shift = 0;
     int green_shift = 0;
     int blue_shift = 0;
+    XFontStruct* font = nullptr;
+    bool overlay = false;
+    unsigned long last_overlay_ms = 0;
+    float overlay_fps = 0.0f;
+    int overlay_frames = 0;
+    std::chrono::steady_clock::time_point overlay_mark{};
 };

@@ -61,6 +61,7 @@ Params Scene::make_params(uint32_t width, uint32_t height) const {
     params.width = width;
     params.height = height;
     params.sphere_count = static_cast<uint32_t>(spheres.size());
+    params.bounces = kDefaultBounces;
     return params;
 }
 

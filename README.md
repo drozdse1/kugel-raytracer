@@ -10,7 +10,9 @@ cmake --build build
 ./build/kugel-raytracer
 ```
 
-Pfeil runter rechnet weniger Strahlen, das Bild wird gröber und schneller. Pfeil hoch macht es wieder feiner. Escape oder Q schließt das Fenster.
+Pfeil runter rechnet weniger Strahlen, das Bild wird gröber und schneller. Pfeil hoch macht es wieder feiner. Pfeil links und rechts stellt die Sprungtiefe ein: 1 bis 8. Weniger Sprünge beenden die Spiegelungen früher. Die Taste ? schaltet ein Debug-Overlay ein: Bildrate, Tiefe und Pixel pro Strahl. Escape oder Q schließt das Fenster.
+
+Die Konsole läuft über spdlog. Info ist grün, Warnungen sind gelb, Fehler sind rot.
 
 Ein Standbild:
 
