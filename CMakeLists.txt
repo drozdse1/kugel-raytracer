@@ -5,7 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(kugel-raytracer src/main.cpp)
+add_executable(kugel-raytracer
+    src/main.cpp
+    src/scene.cpp
+    src/gpu.cpp
+    src/image.cpp
+    src/live_view.cpp)
 target_include_directories(kugel-raytracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(kugel-raytracer SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_compile_options(kugel-raytracer PRIVATE -Wall -Wextra -Wpedantic)
