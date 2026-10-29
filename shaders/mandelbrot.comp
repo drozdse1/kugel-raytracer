@@ -1,0 +1,58 @@
+#version 450
+
+// Eigene Compute-Pipeline für die Tischtextur. Die Weltgrenzen müssen mit
+// floor_albedo() in trace.comp übereinstimmen.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D mandel;
+
+layout(std140, set = 0, binding = 1) uniform MandelParams {
+    vec4 focus_zoom;  // xy Brennpunkt in der komplexen Ebene, z Zoom, w Farbphase
+    vec4 table_iter;  // rgb Farbe weit weg vom Rand, w Iterationen
+};
+
+const vec2 kFloorMin = vec2(-7.0, -2.70);
+const vec2 kFloorMax = vec2(7.0, 8.0);
+const int kIterCap = 768;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(mandel);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec2 xz = mix(kFloorMin, kFloorMax, uv);
+    vec2 base_c = (xz - vec2(0.0, 2.0)) * 0.35 + vec2(-0.25, 0.0);
+    float zoom = max(focus_zoom.z, 1.0);
+    vec2 c = focus_zoom.xy + (base_c - focus_zoom.xy) / zoom;
+
+    vec2 z = vec2(0.0);
+    int max_iter = clamp(int(table_iter.w + 0.5), 32, kIterCap);
+    int iter = 0;
+    for (int i = 0; i < kIterCap; ++i) {
+        if (i >= max_iter) {
+            break;
+        }
+        float x2 = z.x * z.x;
+        float y2 = z.y * z.y;
+        if (x2 + y2 > 4.0) {
+            break;
+        }
+        z = vec2(x2 - y2, 2.0 * z.x * z.y) + c;
+        ++iter;
+    }
+
+    vec3 color = table_iter.rgb;
+    if (iter >= max_iter) {
+        color = vec3(0.025, 0.03, 0.055);
+    } else {
+        float mag = max(length(z), 2.0);
+        float mu = float(iter) + 1.0 - log2(log2(mag));
+        float closeness = smoothstep(1.5, 12.0, mu);
+        vec3 dye = 0.5 + 0.5 * cos(vec3(0.0, 0.55, 1.15) + mu * 0.22 + focus_zoom.w);
+        color = mix(table_iter.rgb, dye, closeness);
+    }
+    imageStore(mandel, pixel, vec4(color, 1.0));
+}

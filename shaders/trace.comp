@@ -1,0 +1,453 @@
+#version 450
+
+// Ein Thread = ein Pixel. Workgroup-Größe muss zum Dispatch in main.cpp passen.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+struct Sphere {
+    vec4 geom;      // xyz Mittelpunkt, w Radius
+    vec4 color;     // rgb Albedo
+    vec4 material;  // x Metall (0 Kunststoff, 1 Metall), y Rauheit
+};
+
+layout(std430, set = 0, binding = 0) buffer PixelBuffer {
+    vec4 pixels[];
+};
+
+layout(std140, set = 0, binding = 1) uniform Params {
+    vec4 cam_pos;
+    vec4 cam_forward;
+    vec4 cam_right;
+    vec4 cam_up;
+    vec4 light_dir;     // xyz Richtung zum Licht, w = tan(vertikaler Öffnungswinkel / 2)
+    vec4 light_color;   // rgb, w = Umgebungslicht
+    vec4 plane_point;
+    vec4 plane_normal;
+    vec4 plane_color;
+    uvec4 image;        // x Breite, y Höhe, z Anzahl Kugeln
+};
+
+layout(std430, set = 0, binding = 2) buffer SphereBuffer {
+    Sphere spheres[];
+};
+
+layout(set = 0, binding = 3) uniform sampler2D floor_tex;
+
+const float kBias = 0.001;
+const uint kMaxSpheres = 8u;
+const int kBounces = 3;
+const float kFloorRoughness = 0.42;
+// Breite der Leiste in der Ebene. Die Höhe (Y) ist halb so groß wie diese Dicke.
+// Die Bildfläche sitzt bei y = 0, also in der Mitte von [-kFrameHalf, +kFrameHalf].
+const float kFrameWidth = 0.30;
+const float kFrameHalf = 0.075;
+const vec2 kFloorMin = vec2(-7.0, -2.70);
+const vec2 kFloorMax = vec2(7.0, 8.0);
+// Groß genug, dass die Kugeln auf ihrer Kreisbahn die Innenwand nicht berühren.
+const vec2 kPictureMin = vec2(-4.8, -2.20);
+const vec2 kPictureMax = vec2(4.8, 3.60);
+
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+float value_noise(vec2 p) {
+    vec2 cell = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(cell);
+    float b = hash21(cell + vec2(1.0, 0.0));
+    float c = hash21(cell + vec2(0.0, 1.0));
+    float d = hash21(cell + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float value = 0.0;
+    float weight = 0.5;
+    for (int octave = 0; octave < 5; ++octave) {
+        value += weight * value_noise(p);
+        p = p * 2.13 + vec2(19.7, 7.3);
+        weight *= 0.5;
+    }
+    return value;
+}
+
+// Fasern aus verzerrtem Rauschen, nicht aus einer festen Periode.
+// Hohe Skalierung über die Leistenbreite, damit die Linien dünn bleiben.
+vec3 wood(vec2 xz, vec2 along, float rail) {
+    float along_pos = dot(xz, along);
+    float across = rail * 130.0;
+    float wander = fbm(vec2(along_pos * 1.7, across * 0.04));
+    float bent = across + wander * 28.0 + fbm(vec2(along_pos * 4.8, rail * 40.0)) * 8.0;
+    float grain = fbm(vec2(along_pos * 0.55, bent * 0.18));
+    float ridge = abs(grain * 2.0 - 1.0);
+    float line = smoothstep(0.16, 0.02, ridge);
+    float gap = fbm(vec2(along_pos * 2.8, bent * 0.07));
+    line *= smoothstep(0.22, 0.58, gap);
+    float pore = smoothstep(0.04, 0.0, abs(fbm(vec2(along_pos * 1.6, bent * 0.45)) * 2.0 - 1.0));
+    vec3 pale = vec3(0.80, 0.60, 0.36);
+    vec3 mid = vec3(0.52, 0.33, 0.16);
+    vec3 dark = vec3(0.15, 0.07, 0.03);
+    vec3 color = mix(mid, pale, fbm(vec2(along_pos * 0.9, rail * 5.0)));
+    color = mix(color, dark, clamp(line * 0.92 + pore * 0.55, 0.0, 1.0));
+    return color;
+}
+
+bool in_rect(vec2 p, vec2 lo, vec2 hi) {
+    return p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y;
+}
+
+vec2 frame_outer_min() {
+    return kPictureMin - vec2(kFrameWidth);
+}
+
+vec2 frame_outer_max() {
+    return kPictureMax + vec2(kFrameWidth);
+}
+
+bool in_picture(vec2 xz) {
+    return in_rect(xz, kPictureMin, kPictureMax);
+}
+
+bool in_frame_border(vec2 xz) {
+    return in_rect(xz, frame_outer_min(), frame_outer_max()) && !in_picture(xz);
+}
+
+vec3 picture_albedo(vec2 xz) {
+    vec2 uv = (xz - kFloorMin) / (kFloorMax - kFloorMin);
+    return texture(floor_tex, clamp(uv, 0.0, 1.0)).rgb;
+}
+
+// Ober- und Unterseite: Fasern längs der Leiste, über die Breite (Gehrung an den Ecken).
+vec3 wood_cap(vec2 xz) {
+    vec2 center = 0.5 * (kPictureMin + kPictureMax);
+    vec2 half_size = 0.5 * (kPictureMax - kPictureMin);
+    vec2 q = xz - center;
+    vec2 delta = abs(q) - half_size;
+    float sd = max(delta.x, delta.y);
+    bool vertical_side = delta.x > delta.y;
+    vec2 outward = vertical_side ? vec2(sign(q.x), 0.0) : vec2(0.0, sign(q.y));
+    vec2 along = vec2(-outward.y, outward.x);
+    return wood(xz, along, max(sd, 0.0));
+}
+
+struct Hit {
+    vec3 pos;
+    vec3 normal;
+    vec3 albedo;
+    float metallic;
+    float roughness;
+    float matte; // 1: nur Farbe und diffuses Licht, kein Glanz und kein Spiegel
+};
+
+void commit_hit(
+    float t,
+    vec3 pos,
+    vec3 normal,
+    vec3 albedo,
+    float roughness,
+    float matte,
+    inout float closest,
+    inout Hit hit,
+    inout bool found) {
+    if (t >= closest) {
+        return;
+    }
+    closest = t;
+    found = true;
+    hit.pos = pos;
+    hit.normal = normal;
+    hit.albedo = albedo;
+    hit.metallic = 0.0;
+    hit.roughness = roughness;
+    hit.matte = matte;
+}
+
+void hit_flat(
+    vec3 origin,
+    vec3 dir,
+    float t_min,
+    float y_plane,
+    vec3 normal,
+    int kind,
+    inout float closest,
+    inout Hit hit,
+    inout bool found) {
+    if (abs(dir.y) < 1e-6) {
+        return;
+    }
+    float t = (y_plane - origin.y) / dir.y;
+    if (t <= t_min || t >= closest) {
+        return;
+    }
+    vec3 pos = origin + dir * t;
+    vec3 albedo;
+    float roughness;
+    float matte;
+    if (kind == 0) {
+        if (!in_picture(pos.xz)) {
+            return;
+        }
+        albedo = picture_albedo(pos.xz);
+        roughness = kFloorRoughness;
+        matte = 0.0;
+    } else if (kind == 1) {
+        if (in_rect(pos.xz, frame_outer_min(), frame_outer_max())) {
+            return;
+        }
+        // Graue Ebene: nur die gegebene Farbe, kein Glanz und kein Spiegel.
+        albedo = plane_color.xyz;
+        roughness = 1.0;
+        matte = 1.0;
+    } else {
+        if (!in_frame_border(pos.xz)) {
+            return;
+        }
+        albedo = wood_cap(pos.xz);
+        roughness = 1.0;
+        matte = 1.0;
+    }
+    commit_hit(t, pos, normal, albedo, roughness, matte, closest, hit, found);
+}
+
+// Senkrechte Holzfläche. use_x: die Ebene ist x = plane, sonst z = plane.
+void hit_wood_wall(
+    vec3 origin,
+    vec3 dir,
+    float t_min,
+    float plane,
+    bool use_x,
+    float span0,
+    float span1,
+    float y0,
+    float y1,
+    vec3 normal,
+    vec2 along,
+    float y_top,
+    inout float closest,
+    inout Hit hit,
+    inout bool found) {
+    float delta = use_x ? dir.x : dir.z;
+    float start = use_x ? origin.x : origin.z;
+    if (abs(delta) < 1e-6) {
+        return;
+    }
+    float t = (plane - start) / delta;
+    if (t <= t_min || t >= closest) {
+        return;
+    }
+    vec3 pos = origin + dir * t;
+    float span = use_x ? pos.z : pos.x;
+    if (span < span0 || span > span1 || pos.y < y0 || pos.y > y1) {
+        return;
+    }
+    commit_hit(t, pos, normal, wood(pos.xz, along, y_top - pos.y), 1.0, 1.0, closest, hit, found);
+}
+
+// Bild in der Mitte der Rahmendicke, Rahmen darum, Tischplatte auf der Unterkante.
+bool hit_static(vec3 origin, vec3 dir, float t_min, out Hit hit, out float t_hit) {
+    hit.pos = vec3(0.0);
+    hit.normal = vec3(0.0, 1.0, 0.0);
+    hit.albedo = vec3(0.0);
+    hit.metallic = 0.0;
+    hit.roughness = 0.0;
+    hit.matte = 0.0;
+    float closest = 1e30;
+    bool found = false;
+    float mid = plane_point.y;
+    float y_bot = mid - kFrameHalf;
+    float y_top = mid + kFrameHalf;
+    vec2 lo = frame_outer_min();
+    vec2 hi = frame_outer_max();
+    // Kleiner als kBias, damit die Oberseite die verlängerte Wand nicht selbst trifft.
+    float y_pad = 0.0002;
+    float xz_pad = 0.001;
+    vec3 up = normalize(plane_normal.xyz);
+
+    hit_flat(origin, dir, t_min, mid, up, 0, closest, hit, found);
+    hit_flat(origin, dir, t_min, y_bot, up, 1, closest, hit, found);
+    hit_flat(origin, dir, t_min, y_top, up, 2, closest, hit, found);
+    hit_flat(origin, dir, t_min, y_bot, -up, 2, closest, hit, found);
+
+    hit_wood_wall(origin, dir, t_min, lo.x, true, lo.y - xz_pad, hi.y + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(-1.0, 0.0, 0.0), vec2(0.0, 1.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, hi.x, true, lo.y - xz_pad, hi.y + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(1.0, 0.0, 0.0), vec2(0.0, 1.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, lo.y, false, lo.x - xz_pad, hi.x + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(0.0, 0.0, -1.0), vec2(1.0, 0.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, hi.y, false, lo.x - xz_pad, hi.x + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(0.0, 0.0, 1.0), vec2(1.0, 0.0), y_top, closest, hit, found);
+
+    hit_wood_wall(origin, dir, t_min, kPictureMin.x, true, kPictureMin.y - xz_pad, kPictureMax.y + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(1.0, 0.0, 0.0), vec2(0.0, 1.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, kPictureMax.x, true, kPictureMin.y - xz_pad, kPictureMax.y + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(-1.0, 0.0, 0.0), vec2(0.0, 1.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, kPictureMin.y, false, kPictureMin.x - xz_pad, kPictureMax.x + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(0.0, 0.0, 1.0), vec2(1.0, 0.0), y_top, closest, hit, found);
+    hit_wood_wall(origin, dir, t_min, kPictureMax.y, false, kPictureMin.x - xz_pad, kPictureMax.x + xz_pad, y_bot - y_pad, y_top + y_pad,
+        vec3(0.0, 0.0, -1.0), vec2(1.0, 0.0), y_top, closest, hit, found);
+
+    t_hit = closest;
+    return found;
+}
+
+bool hit_sphere(vec3 origin, vec3 dir, vec4 geom, float t_min, float t_max, out float t, out vec3 normal) {
+    vec3 oc = origin - geom.xyz;
+    float b = dot(oc, dir);
+    float disc = b * b - (dot(oc, oc) - geom.w * geom.w);
+    if (disc < 0.0) {
+        return false;
+    }
+    float s = sqrt(disc);
+    t = -b - s;
+    if (t < t_min || t > t_max) {
+        t = -b + s;
+    }
+    if (t < t_min || t > t_max) {
+        return false;
+    }
+    normal = normalize(origin + dir * t - geom.xyz);
+    return true;
+}
+
+bool blocked(vec3 origin, vec3 dir, uint count) {
+    Hit obstacle;
+    float obstacle_t;
+    if (hit_static(origin, dir, kBias, obstacle, obstacle_t)) {
+        return true;
+    }
+    for (uint i = 0u; i < kMaxSpheres; i++) {
+        if (i >= count) {
+            break;
+        }
+        float t;
+        vec3 normal;
+        if (hit_sphere(origin, dir, spheres[i].geom, kBias, 1e9, t, normal)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool closest_hit(vec3 origin, vec3 dir, float t_min, uint count, out Hit hit) {
+    float closest = 1e30;
+    bool found = false;
+    float surface_t;
+    if (hit_static(origin, dir, t_min, hit, surface_t)) {
+        closest = surface_t;
+        found = true;
+    }
+
+    for (uint i = 0u; i < kMaxSpheres; i++) {
+        if (i >= count) {
+            break;
+        }
+        float t;
+        vec3 normal;
+        if (hit_sphere(origin, dir, spheres[i].geom, t_min, closest, t, normal)) {
+            closest = t;
+            found = true;
+            hit.pos = origin + dir * t;
+            hit.normal = normal;
+            hit.albedo = spheres[i].color.xyz;
+            hit.metallic = spheres[i].material.x;
+            hit.roughness = spheres[i].material.y;
+            hit.matte = 0.0;
+        }
+    }
+
+    if (found && dot(hit.normal, dir) > 0.0) {
+        hit.normal = -hit.normal;
+    }
+    return found;
+}
+
+vec3 sky(vec3 dir) {
+    vec3 light = normalize(light_dir.xyz);
+    float height = clamp(dir.y * 0.55 + 0.45, 0.0, 1.0);
+    vec3 color = mix(vec3(0.78, 0.80, 0.83), vec3(0.32, 0.52, 0.88), height);
+    float sun = pow(max(dot(dir, light), 0.0), 700.0);
+    color += vec3(1.0, 0.97, 0.90) * sun * 12.0;
+    return color;
+}
+
+vec3 fresnel_schlick(vec3 f0, float cosine) {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
+// Direktes Licht plus Spiegelanteil. Die Rauheit macht aus dem Glanzpunkt
+// entweder einen harten Chrom-Punkt oder einen breiten Kunststoff-Glanz.
+vec3 shade_direct(Hit hit, vec3 ray_dir, uint count, vec3 reflection_gain) {
+    vec3 to_light = normalize(light_dir.xyz);
+    float ndotl = max(dot(hit.normal, to_light), 0.0);
+    float shadow = 1.0;
+    if (ndotl > 0.0 && blocked(hit.pos + hit.normal * kBias, to_light, count)) {
+        shadow = 0.0;
+    }
+    vec3 light = light_color.xyz * (light_color.w + ndotl * shadow);
+    vec3 diffuse = (1.0 - hit.metallic) * hit.albedo * light * (vec3(1.0) - reflection_gain);
+
+    vec3 specular = vec3(0.0);
+    if (hit.matte < 0.5 && shadow > 0.0 && ndotl > 0.0) {
+        vec3 half_dir = normalize(to_light - ray_dir);
+        float exponent = exp2(11.0 * (1.0 - hit.roughness));
+        float ndoth = max(dot(hit.normal, half_dir), 0.0);
+        float peak = pow(ndoth, exponent) * (exponent + 2.0) / 8.0;
+        vec3 f0 = mix(vec3(0.04), hit.albedo, hit.metallic);
+        float facing = max(dot(-ray_dir, half_dir), 0.0);
+        specular = fresnel_schlick(f0, facing) * light_color.xyz * peak;
+    }
+    return diffuse + specular;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= image.x || y >= image.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(x, y) + 0.5) / vec2(image.xy);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float aspect = float(image.x) / float(image.y);
+    vec3 dir = normalize(cam_forward.xyz
+        + ndc.x * aspect * light_dir.w * cam_right.xyz
+        + ndc.y * light_dir.w * cam_up.xyz);
+    vec3 origin = cam_pos.xyz;
+    uint count = min(image.z, kMaxSpheres);
+
+    vec3 color = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    for (int bounce = 0; bounce < kBounces; ++bounce) {
+        Hit hit;
+        if (!closest_hit(origin, dir, kBias, count, hit)) {
+            color += throughput * sky(dir);
+            break;
+        }
+
+        vec3 reflection_gain = vec3(0.0);
+        if (hit.matte < 0.5) {
+            vec3 f0 = mix(vec3(0.04), hit.albedo, hit.metallic);
+            float ndotv = max(dot(hit.normal, -dir), 0.0);
+            vec3 fresnel = fresnel_schlick(f0, ndotv);
+            float clarity = pow(clamp(1.0 - hit.roughness, 0.0, 1.0), 2.0);
+            reflection_gain = fresnel * mix(clarity, 1.0, hit.metallic);
+        }
+
+        color += throughput * shade_direct(hit, dir, count, reflection_gain);
+
+        float strongest = max(reflection_gain.r, max(reflection_gain.g, reflection_gain.b));
+        if (bounce + 1 == kBounces || strongest < 0.02) {
+            break;
+        }
+        throughput *= reflection_gain;
+        origin = hit.pos + hit.normal * kBias;
+        dir = reflect(dir, hit.normal);
+    }
+
+    color = pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+    pixels[y * image.x + x] = vec4(color, 1.0);
+}
