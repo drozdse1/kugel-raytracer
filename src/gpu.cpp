@@ -155,6 +155,26 @@ void Gpu::create_device() {
     VkInstanceCreateInfo instance_info{};
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
+#if defined(__APPLE__)
+    // MoltenVK ist kein voll konformes Gerät. Ohne dieses Bit zählt der Lader es nicht.
+    uint32_t extension_count = 0;
+    vk_check(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr),
+             "vkEnumerateInstanceExtensionProperties");
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    if (extension_count > 0) {
+        vk_check(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, extensions.data()),
+                 "vkEnumerateInstanceExtensionProperties");
+    }
+    const char* portability_enumeration = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    for (const VkExtensionProperties& extension : extensions) {
+        if (std::strcmp(extension.extensionName, portability_enumeration) == 0) {
+            instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            instance_info.enabledExtensionCount = 1;
+            instance_info.ppEnabledExtensionNames = &portability_enumeration;
+            break;
+        }
+    }
+#endif
     vk_check(vkCreateInstance(&instance_info, nullptr, &instance), "vkCreateInstance");
 
     uint32_t count = 0;
@@ -233,6 +253,25 @@ void Gpu::create_device() {
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+#if defined(__APPLE__)
+    uint32_t device_extension_count = 0;
+    vk_check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &device_extension_count, nullptr),
+             "vkEnumerateDeviceExtensionProperties");
+    std::vector<VkExtensionProperties> device_extensions(device_extension_count);
+    if (device_extension_count > 0) {
+        vk_check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &device_extension_count,
+                                                      device_extensions.data()),
+                 "vkEnumerateDeviceExtensionProperties");
+    }
+    const char* portability_subset = "VK_KHR_portability_subset";
+    for (const VkExtensionProperties& extension : device_extensions) {
+        if (std::strcmp(extension.extensionName, portability_subset) == 0) {
+            device_info.enabledExtensionCount = 1;
+            device_info.ppEnabledExtensionNames = &portability_subset;
+            break;
+        }
+    }
+#endif
     vk_check(vkCreateDevice(physical, &device_info, nullptr, &device), "vkCreateDevice");
     vkGetDeviceQueue(device, queue_family, 0, &queue);
 }

@@ -14,6 +14,15 @@ Pfeil runter rechnet weniger Strahlen, das Bild wird gröber und schneller. Pfei
 
 Die Konsole läuft über spdlog. Info ist grün, Warnungen sind gelb, Fehler sind rot.
 
+macOS hat kein X11. Dafür liegen MoltenVK und SDL auf dem Rechner:
+
+```
+brew install molten-vk sdl2 pkg-config
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/kugel-raytracer
+```
+
 Ein Standbild:
 
 ```
